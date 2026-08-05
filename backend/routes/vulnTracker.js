@@ -4,6 +4,15 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('../utils/db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { log } = require('../utils/logger');
+const xss = require('xss');
+
+// Matches the handling in riskAcceptance.js and itInfra.js — these routes do not
+// go through the express-validator rule sets, so they clean their own input.
+const clean = v => v ? xss(String(v).trim()).slice(0, 1000) : '';
+
+const VALID_SEVERITY = ['Critical', 'High', 'Medium', 'Low', 'Informational', ''];
+const VALID_STATUS = ['Pending', 'Resolved', 'Risk Acceptance', 'Business Requirements', ''];
+const coerce = (val, valid) => valid.includes(val) ? val : '';
 
 // GET /api/vuln-tracker — list all with optional filters
 router.get('/', authenticate, (req, res) => {
@@ -20,14 +29,18 @@ router.get('/', authenticate, (req, res) => {
 // POST /api/vuln-tracker
 router.post('/', authenticate, authorize('admin', 'engineer'), (req, res) => {
   const { vulnerability_name, severity, project_id, project_name, mitigation_status, mitigation_date, mitigation_team } = req.body;
-  if (!vulnerability_name) return res.status(400).json({ error: 'vulnerability_name required' });
+  const name = clean(vulnerability_name);
+  if (!name) return res.status(400).json({ error: 'vulnerability_name required' });
 
   const result = db.prepare(`
     INSERT INTO vuln_tracker (uuid, vulnerability_name, severity, project_id, project_name, mitigation_status, mitigation_date, mitigation_team, created_by, updated_by)
     VALUES (?,?,?,?,?,?,?,?,?,?)
-  `).run(uuidv4(), vulnerability_name, severity || '', project_id || null, project_name || '', mitigation_status || 'Pending', mitigation_date || '', mitigation_team || '', req.user.id, req.user.id);
+  `).run(uuidv4(), name, coerce(clean(severity), VALID_SEVERITY),
+         /^\d+$/.test(String(project_id)) ? Number(project_id) : null,
+         clean(project_name), coerce(clean(mitigation_status), VALID_STATUS) || 'Pending',
+         clean(mitigation_date), clean(mitigation_team), req.user.id, req.user.id);
 
-  log(req, 'CREATE_VULN_TRACKER', 'vuln_tracker', String(result.lastInsertRowid), vulnerability_name);
+  log(req, 'CREATE_VULN_TRACKER', 'vuln_tracker', String(result.lastInsertRowid), name);
   res.status(201).json(db.prepare('SELECT * FROM vuln_tracker WHERE id = ?').get(result.lastInsertRowid));
 });
 
@@ -39,13 +52,19 @@ router.put('/:id', authenticate, authorize('admin', 'engineer'), (req, res) => {
   if (!existing) return res.status(404).json({ error: 'Not found' });
 
   const { vulnerability_name, severity, project_id, project_name, mitigation_status, mitigation_date, mitigation_team } = req.body;
+  const name = clean(vulnerability_name);
+  if (!name) return res.status(400).json({ error: 'vulnerability_name required' });
+
   db.prepare(`
     UPDATE vuln_tracker SET vulnerability_name=?, severity=?, project_id=?, project_name=?,
       mitigation_status=?, mitigation_date=?, mitigation_team=?, updated_by=?, updated_at=CURRENT_TIMESTAMP
     WHERE id=?
-  `).run(vulnerability_name, severity, project_id || null, project_name, mitigation_status, mitigation_date, mitigation_team, req.user.id, id);
+  `).run(name, coerce(clean(severity), VALID_SEVERITY),
+         /^\d+$/.test(String(project_id)) ? Number(project_id) : null,
+         clean(project_name), coerce(clean(mitigation_status), VALID_STATUS),
+         clean(mitigation_date), clean(mitigation_team), req.user.id, id);
 
-  log(req, 'UPDATE_VULN_TRACKER', 'vuln_tracker', id, vulnerability_name);
+  log(req, 'UPDATE_VULN_TRACKER', 'vuln_tracker', id, name);
   res.json(db.prepare('SELECT * FROM vuln_tracker WHERE id = ?').get(id));
 });
 

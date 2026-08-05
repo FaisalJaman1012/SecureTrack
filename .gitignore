@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Production build output
+frontend/build/
+
+# Secrets — never commit
+.env
+backend/.env
+!frontend/.env
+
+# Runtime data (database, WAL/SHM sidecars, uploads, logs, backups)
+backend/securetrack.db
+backend/securetrack.db-wal
+backend/securetrack.db-shm
+backend/uploads/
+backend/logs/
+backups/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Logs
+npm-debug.log*
+yarn-error.log*

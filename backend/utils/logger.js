@@ -30,6 +30,15 @@ const checkAndCreateDeadlineAlerts = (project, createdBy) => {
     const daysUntil = Math.ceil((deadline - now) / (1000 * 60 * 60 * 24));
 
     if (daysUntil <= 3 && daysUntil >= 0) {
+      // This runs on every save. Without this check, editing a project five
+      // times near its deadline produces five identical alerts.
+      const alreadyAlerted = db.prepare(`
+        SELECT id FROM alerts
+        WHERE type = 'deadline' AND resource_type = 'project' AND resource_id = ?
+          AND date(created_at) = date('now')
+      `).get(String(project.id));
+      if (alreadyAlerted) return;
+
       const { v4: uuidv4 } = require('uuid');
       db.prepare(`
         INSERT INTO alerts (uuid, type, title, message, severity, resource_type, resource_id, target_role, created_by)
