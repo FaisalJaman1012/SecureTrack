@@ -77,4 +77,24 @@ const uploadImport = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
 });
 
-module.exports = { uploadAttachment, uploadImport, ATTACHMENT_DIR, IMPORT_DIR };
+/**
+ * Recovers the real UTF-8 filename from a multipart upload.
+ *
+ * Busboy (under multer) decodes the filename in a multipart part as latin1, so
+ * anything outside ASCII arrives mojibake — a file named "নিরাপত্তা.pdf" is
+ * stored as "à¦¨à¦¿à§...". Re-reading those bytes as UTF-8 restores the original.
+ * Falls back to the raw value if the bytes are not valid UTF-8.
+ */
+const decodeOriginalName = (name) => {
+  if (!name) return '';
+  try {
+    const bytes = Buffer.from(name, 'latin1');
+    const decoded = bytes.toString('utf8');
+    // A round trip that loses information means it was not latin1-encoded UTF-8
+    return Buffer.from(decoded, 'utf8').equals(bytes) ? decoded : name;
+  } catch {
+    return name;
+  }
+};
+
+module.exports = { uploadAttachment, uploadImport, ATTACHMENT_DIR, IMPORT_DIR, decodeOriginalName };

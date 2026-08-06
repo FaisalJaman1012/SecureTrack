@@ -1,8 +1,17 @@
-const Database = require('better-sqlite3');
-const bcrypt = require('bcryptjs');
 const path = require('path');
 
-const db = new Database(path.join(__dirname, '..', 'securetrack.db'));
+// server.js loads this too; dotenv is idempotent and this keeps standalone
+// scripts (backup, maintenance) reading the same configuration.
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+const fs = require('fs');
+
+const DB_PATH = path.join(__dirname, '..', 'securetrack.db');
+const isNewDatabase = !fs.existsSync(DB_PATH);
+
+const db = new Database(DB_PATH);
 
 // Enable WAL mode for better concurrent performance
 db.pragma('journal_mode = WAL');
@@ -176,6 +185,42 @@ db.exec(`
     FOREIGN KEY(created_by) REFERENCES users(id)
   );
 
+  -- Vulnerability tracker (per-vulnerability mitigation follow-up)
+  CREATE TABLE IF NOT EXISTS vuln_tracker (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid TEXT UNIQUE NOT NULL,
+    vulnerability_name TEXT NOT NULL,
+    severity TEXT,
+    project_id INTEGER,
+    project_name TEXT,
+    mitigation_status TEXT DEFAULT 'Pending',
+    mitigation_date TEXT,
+    mitigation_team TEXT,
+    created_by INTEGER,
+    updated_by INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
+    FOREIGN KEY(created_by) REFERENCES users(id)
+  );
+
+  -- IT infrastructure assets
+  CREATE TABLE IF NOT EXISTS it_infra (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid TEXT UNIQUE NOT NULL,
+    asset_category TEXT,
+    hostname TEXT,
+    ip_address TEXT,
+    last_test TEXT,
+    report_share TEXT,
+    remarks TEXT,
+    created_by INTEGER,
+    updated_by INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(created_by) REFERENCES users(id)
+  );
+
   -- Indexes for performance
   CREATE INDEX IF NOT EXISTS idx_projects_severity ON projects(severity);
   CREATE INDEX IF NOT EXISTS idx_projects_assigned ON projects(assigned_to);
@@ -183,19 +228,119 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id);
   CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_logs(created_at);
   CREATE INDEX IF NOT EXISTS idx_alerts_target ON alerts(target_user_id, is_read);
+  CREATE INDEX IF NOT EXISTS idx_attachments_source ON attachments(source_type, source_id);
+  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);
+  CREATE INDEX IF NOT EXISTS idx_vuln_tracker_project ON vuln_tracker(project_id);
+  CREATE INDEX IF NOT EXISTS idx_it_infra_hostname ON it_infra(hostname);
 `);
 
-// Seed default admin user
+// ─── SCHEMA MIGRATIONS ───────────────────────────────────────────────────────
+//
+// The CREATE TABLE statements above use IF NOT EXISTS, which means they create
+// missing tables but never alter existing ones. On a server that is upgraded by
+// pulling new code, that is not enough: a release that adds a column to an
+// existing table would otherwise require deleting the production database.
+//
+// Everything below runs automatically on boot, is idempotent, and never drops
+// or rewrites user data.
+//
+// HOW TO ADD A MIGRATION IN A FUTURE RELEASE
+//   1. Append an entry to the MIGRATIONS array. Never edit or reorder an entry
+//      that has already shipped — completed ids are recorded in the database.
+//   2. Additive changes only: ADD COLUMN, CREATE TABLE, CREATE INDEX, UPDATE.
+//      Anything that drops or renames a column needs a manual, reviewed plan.
+//   3. Deploy. The service takes a safety copy of the database before applying
+//      anything, then applies pending migrations in one transaction.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    id TEXT PRIMARY KEY,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+/** Adds a column only if the table does not already have it. */
+const addColumnIfMissing = (table, column, definition) => {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  if (!columns.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    console.log(`   + ${table}.${column}`);
+  }
+};
+
+const MIGRATIONS = [
+  {
+    // Baseline. Tables created by the block above; recorded so the migration
+    // log is meaningful from the first release that shipped this system.
+    id: '2026-08-01-baseline',
+    up: () => {},
+  },
+  // Example for the next release — copy this shape, do not edit the entries above:
+  //
+  // {
+  //   id: '2026-09-01-add-project-owner',
+  //   up: () => addColumnIfMissing('projects', 'business_owner', 'TEXT'),
+  // },
+];
+
+const appliedIds = new Set(db.prepare('SELECT id FROM schema_migrations').all().map(r => r.id));
+const pending = MIGRATIONS.filter(m => !appliedIds.has(m.id));
+
+if (pending.length) {
+  // Safety copy before touching the schema. Skipped for a brand new database
+  // (nothing to lose) and best-effort: a failed copy must not block startup on
+  // a read-only or full disk, but it is loud about it.
+  if (!isNewDatabase) {
+    try {
+      const backupDir = path.join(__dirname, '..', '..', 'backups');
+      fs.mkdirSync(backupDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const target = path.join(backupDir, `securetrack-premigration-${stamp}.db`);
+      // VACUUM INTO produces a consistent snapshot including un-checkpointed WAL
+      db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
+      console.log(`🛡️  Pre-migration backup: ${target}`);
+    } catch (e) {
+      console.error(`⚠️  Could not write pre-migration backup: ${e.message}`);
+    }
+  }
+
+  console.log(`🔧 Applying ${pending.length} schema migration(s)…`);
+  const record = db.prepare('INSERT INTO schema_migrations (id) VALUES (?)');
+
+  // One transaction for all of them: either the schema moves forward completely
+  // or the database is left exactly as it was.
+  db.transaction(() => {
+    for (const migration of pending) {
+      console.log(`   → ${migration.id}`);
+      migration.up();
+      record.run(migration.id);
+    }
+  })();
+
+  console.log('✅ Schema up to date.');
+}
+
+// Purge refresh tokens that have already expired (runs on every boot)
+db.prepare('DELETE FROM refresh_tokens WHERE expires_at <= CURRENT_TIMESTAMP').run();
+
+// Seed default admin user. On a fresh production install set ADMIN_PASSWORD in
+// backend/.env so the well-known default password is never written to disk.
 const adminExists = db.prepare('SELECT id FROM users WHERE role = ?').get('admin');
 if (!adminExists) {
-  const hash = bcrypt.hashSync('Admin@SecureTrack2024', 12);
+  const initialPassword = process.env.ADMIN_PASSWORD || 'Admin@SecureTrack2024';
+  const hash = bcrypt.hashSync(initialPassword, 12);
   const { v4: uuidv4 } = require('uuid');
   db.prepare(`
     INSERT INTO users (uuid, username, email, password_hash, role, full_name)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(uuidv4(), 'admin', 'admin@securetrack.local', hash, 'admin', 'System Administrator');
+  `).run(uuidv4(), 'admin', process.env.ADMIN_EMAIL || 'admin@securetrack.local', hash, 'admin', 'System Administrator');
 
-  console.log('✅ Default admin created: admin / Admin@SecureTrack2024');
+  if (process.env.ADMIN_PASSWORD) {
+    console.log('✅ Default admin created: admin (password taken from ADMIN_PASSWORD)');
+  } else {
+    console.log('✅ Default admin created: admin / Admin@SecureTrack2024');
+    console.warn('⚠️  Change this password immediately after the first login.');
+  }
 }
 
 module.exports = db;

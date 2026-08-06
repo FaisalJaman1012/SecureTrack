@@ -5,7 +5,7 @@ const fs      = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const db      = require('../utils/db');
 const { authenticate, authorize } = require('../middleware/auth');
-const { uploadAttachment, ATTACHMENT_DIR } = require('../middleware/upload');
+const { uploadAttachment, ATTACHMENT_DIR, decodeOriginalName } = require('../middleware/upload');
 const { log } = require('../utils/logger');
 
 // ── Helper ─────────────────────────────────────────────────────
@@ -41,7 +41,14 @@ function serveFile(req, res, inline) {
 
   if (inline) {
     res.setHeader('Content-Type', att.mime_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${att.original_name}"`);
+    // original_name is whatever the uploader called the file. Quotes and control
+    // characters in it would break out of the header parameter, so send an ASCII
+    // fallback plus RFC 5987 filename* for the real name.
+    const asciiName = att.original_name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(att.original_name)}`
+    );
     res.sendFile(filePath);
   } else {
     res.download(filePath, att.original_name);
@@ -132,21 +139,22 @@ router.post('/:sourceType/:sourceId', authenticate, authorize('admin','engineer'
 
     const inserted = [];
     for (const file of req.files) {
+      const originalName = decodeOriginalName(file.originalname);
       const result = db.prepare(`
         INSERT INTO attachments (uuid, source_type, source_id, source_name, original_name, stored_name, mime_type, file_size, uploaded_by)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(uuidv4(), sourceType, parseInt(sourceId), sourceName,
-             file.originalname, file.filename, file.mimetype, file.size, req.user.id);
+             originalName, file.filename, file.mimetype, file.size, req.user.id);
       inserted.push({
         id: result.lastInsertRowid,
-        original_name: file.originalname,
+        original_name: originalName,
         mime_type: file.mimetype,
         file_size: file.size,
       });
     }
 
     log(req, 'UPLOAD_ATTACHMENT', sourceType, sourceId, sourceName,
-      `Uploaded ${req.files.length} file(s): ${req.files.map(f => f.originalname).join(', ')}`);
+      `Uploaded ${req.files.length} file(s): ${inserted.map(f => f.original_name).join(', ')}`);
 
     res.status(201).json({ message: `${inserted.length} file(s) uploaded`, files: inserted });
   });

@@ -1,4 +1,5 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700;1,14..32,400&family=JetBrains+Mono:wght@300;400;500&family=Manrope:wght@500;600;700;800&display=swap');
+/* Self-hosted fonts — the production server has no internet access. */
+@import './fonts/fonts.css';
 
 /* ── DARK THEME ───────────────────────────────────────────────── */
 :root {

@@ -6,7 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const xml2js = require('xml2js');
 const db = require('../utils/db');
 const { authenticate, authorize } = require('../middleware/auth');
-const { uploadImport } = require('../middleware/upload');
+const { uploadImport, decodeOriginalName } = require('../middleware/upload');
 const { log } = require('../utils/logger');
 const xss = require('xss');
 
@@ -173,6 +173,12 @@ async function processImport(filePath, ext, targetType, userId) {
   const VALID_MIT_A     = ['Mitigated','Not Mitigated',''];
   const coerce = (val, valid) => valid.includes(val) ? val : '';
 
+  // Each .run() below would otherwise be its own implicit transaction, meaning
+  // one fsync per row. On a spinning disk a few thousand rows takes minutes and
+  // a mid-file failure leaves half the data committed. runInTransaction() makes
+  // the whole import a single atomic unit.
+  const runInTransaction = (fn) => db.transaction(fn)();
+
   if (isProject) {
     const insertProject = db.prepare(`
       INSERT INTO projects (uuid, application_name, url, vulnerability_name, vulnerabilities, severity,
@@ -182,6 +188,7 @@ async function processImport(filePath, ext, targetType, userId) {
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `);
 
+    runInTransaction(() => {
     for (let i = 0; i < rows.length; i++) {
       try {
         const r = mapper(rows[i]);
@@ -218,6 +225,7 @@ async function processImport(filePath, ext, targetType, userId) {
         skipped++;
       }
     }
+    });
 
   } else {
     // ── Applications — no grouping needed ─────────────────────────────────────
@@ -228,6 +236,7 @@ async function processImport(filePath, ext, targetType, userId) {
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `);
 
+    runInTransaction(() => {
     for (let i = 0; i < rows.length; i++) {
       try {
         const r = mapper(rows[i]);
@@ -255,6 +264,7 @@ async function processImport(filePath, ext, targetType, userId) {
         skipped++;
       }
     }
+    });
   }
 
   return { total: rows.length, imported, skipped, errors };
@@ -273,7 +283,8 @@ router.post('/:type', authenticate, authorize('admin', 'engineer'), (req, res) =
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
+    const originalName = decodeOriginalName(req.file.originalname);
+    const ext = path.extname(originalName).toLowerCase();
     const filePath = req.file.path;
 
     try {
@@ -284,13 +295,13 @@ router.post('/:type', authenticate, authorize('admin', 'engineer'), (req, res) =
         INSERT INTO import_logs (filename, format, total_rows, imported, skipped, errors, imported_by)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(
-        req.file.originalname, ext.slice(1).toUpperCase(),
+        originalName, ext.slice(1).toUpperCase(),
         result.total || 0, result.imported, result.skipped,
         result.errors.length ? JSON.stringify(result.errors.slice(0, 20)) : null,
         req.user.id
       );
 
-      log(req, 'IMPORT_DATA', type, null, req.file.originalname,
+      log(req, 'IMPORT_DATA', type, null, originalName,
         `Imported ${result.imported}/${result.total || 0} rows`);
 
       res.json({

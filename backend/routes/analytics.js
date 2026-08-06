@@ -133,7 +133,17 @@ router.get('/productivity', authenticate, (req, res) => {
 // ─── ACTIVITY LOGS ────────────────────────────────────────────────────────────
 
 router.get('/logs', authenticate, authorize('admin'), (req, res) => {
-  const { limit = 100, offset = 0, user, action } = req.query;
+  const { user, action } = req.query;
+
+  // Non-numeric input used to reach the driver as NaN and throw a 500, and an
+  // arbitrarily large limit could dump the whole audit table in one request.
+  const clampInt = (value, fallback, min, max) => {
+    const n = parseInt(value, 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(Math.max(n, min), max);
+  };
+  const limit = clampInt(req.query.limit, 100, 1, 1000);
+  const offset = clampInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
 
   let query = 'SELECT * FROM activity_logs WHERE 1=1';
   const params = [];
@@ -142,7 +152,7 @@ router.get('/logs', authenticate, authorize('admin'), (req, res) => {
   if (action) { query += ' AND action = ?'; params.push(action); }
 
   query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-  params.push(parseInt(limit), parseInt(offset));
+  params.push(limit, offset);
 
   const rows = db.prepare(query).all(...params);
   const total = db.prepare('SELECT COUNT(*) as c FROM activity_logs').get().c;
@@ -187,7 +197,20 @@ router.get('/alerts/unread-count', authenticate, (req, res) => {
 router.patch('/alerts/:id/read', authenticate, (req, res) => {
   const { id } = req.params;
   if (!/^\d+$/.test(id)) return res.status(400).json({ error: 'Invalid ID' });
-  db.prepare('UPDATE alerts SET is_read = 1 WHERE id = ?').run(id);
+
+  // Only alerts this user can actually see may be marked read — the id alone is
+  // guessable, and the same visibility rules as GET /alerts apply here.
+  const result = req.user.role === 'admin'
+    ? db.prepare(`
+        UPDATE alerts SET is_read = 1
+        WHERE id = ? AND (target_user_id = ? OR target_user_id IS NULL OR target_role = 'admin')
+      `).run(id, req.user.id)
+    : db.prepare(`
+        UPDATE alerts SET is_read = 1
+        WHERE id = ? AND (target_user_id = ? OR target_role = ?)
+      `).run(id, req.user.id, req.user.role);
+
+  if (result.changes === 0) return res.status(404).json({ error: 'Alert not found' });
   res.json({ message: 'Marked as read' });
 });
 
